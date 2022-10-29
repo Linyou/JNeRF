@@ -1,0 +1,1 @@
+python tools/run_net.py --config-file ./projects/ngp/configs/comp/ngp_car_huber_op_1e-4.py

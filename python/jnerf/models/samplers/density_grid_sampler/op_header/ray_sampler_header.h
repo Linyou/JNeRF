@@ -545,12 +545,43 @@ struct NerfDirection
 	Eigen::Vector3f d;
 };
 
+// struct NerfCoordinate
+// {
+// 	NGP_HOST_DEVICE NerfCoordinate(const Eigen::Vector3f &pos, const Eigen::Vector3f &dir, float dt) : pos{pos, dt}, dt{dt}, dir{dir, dt} {}
+// 	NGP_HOST_DEVICE void set_with_optional_light_dir(const Eigen::Vector3f &pos, const Eigen::Vector3f &dir, float dt, const Eigen::Vector3f &light_dir, uint32_t stride_in_bytes)
+// 	{
+// 		this->dt = dt;
+// 		this->pos = NerfPosition(pos, dt);
+// 		this->dir = NerfDirection(dir, dt);
+
+// 		if (stride_in_bytes >= sizeof(Eigen::Vector3f) + sizeof(NerfCoordinate))
+// 		{
+// 			*(Eigen::Vector3f *)(this + 1) = light_dir;
+// 		}
+// 	}
+// 	// NGP_HOST_DEVICE void copy_with_optional_light_dir(const NerfCoordinate &inp, uint32_t stride_in_bytes)
+// 	// {
+// 	// 	*this = inp;
+// 	// 	if (stride_in_bytes >= sizeof(Eigen::Vector3f) + sizeof(NerfCoordinate))
+// 	// 	{
+// 	// 		*(Eigen::Vector3f *)(this + 1) = *(Eigen::Vector3f *)(&inp + 1);
+// 	// 	}
+// 	// }
+
+// 	NerfPosition pos;
+// 	float dt;
+// 	NerfDirection dir;
+// };
+
+
 struct NerfCoordinate
 {
-	NGP_HOST_DEVICE NerfCoordinate(const Eigen::Vector3f &pos, const Eigen::Vector3f &dir, float dt) : pos{pos, dt}, dt{dt}, dir{dir, dt} {}
-	NGP_HOST_DEVICE void set_with_optional_light_dir(const Eigen::Vector3f &pos, const Eigen::Vector3f &dir, float dt, const Eigen::Vector3f &light_dir, uint32_t stride_in_bytes)
+	NGP_HOST_DEVICE NerfCoordinate(const Eigen::Vector3f &pos, const Eigen::Vector3f &dir, float dt, float ts, float te) : pos{pos, dt}, dt{dt}, ts{ts}, te{te}, dir{dir, dt} {}
+	NGP_HOST_DEVICE void set_with_optional_light_dir(const Eigen::Vector3f &pos, const Eigen::Vector3f &dir, float dt, float ts, float te, const Eigen::Vector3f &light_dir, uint32_t stride_in_bytes)
 	{
 		this->dt = dt;
+		this->ts = ts;
+		this->te = te;
 		this->pos = NerfPosition(pos, dt);
 		this->dir = NerfDirection(dir, dt);
 
@@ -559,29 +590,39 @@ struct NerfCoordinate
 			*(Eigen::Vector3f *)(this + 1) = light_dir;
 		}
 	}
-	NGP_HOST_DEVICE void copy_with_optional_light_dir(const NerfCoordinate &inp, uint32_t stride_in_bytes)
-	{
-		*this = inp;
-		if (stride_in_bytes >= sizeof(Eigen::Vector3f) + sizeof(NerfCoordinate))
-		{
-			*(Eigen::Vector3f *)(this + 1) = *(Eigen::Vector3f *)(&inp + 1);
-		}
-	}
 
 	NerfPosition pos;
 	float dt;
+	float ts;
+	float te;
 	NerfDirection dir;
 };
 
-// struct NerfPayload
-// {
-// 	Eigen::Vector3f origin;
-// 	Eigen::Vector3f dir;
-// 	float t;
-// 	uint32_t idx;
-// 	uint16_t n_steps;
-// 	bool alive;
-// };
+struct NerfSampleInfo
+{
+	NGP_HOST_DEVICE NerfSampleInfo(float ws, float ts, float te) : ws{ws}, ts{ts}, te{te} {}
+	NGP_HOST_DEVICE void set(float ws, float ts, float te)
+	{
+		this->ws = ws;
+		this->ts = ts;
+		this->te = te;
+
+	}
+
+	float ws;
+	float ts;
+	float te;
+};
+
+struct NerfPayload
+{
+	Eigen::Vector3f origin;
+	Eigen::Vector3f dir;
+	float t;
+	uint32_t idx;
+	uint16_t n_steps;
+	bool alive;
+};
 
 template <typename T>
 struct PitchedPtr

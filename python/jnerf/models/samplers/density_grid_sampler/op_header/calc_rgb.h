@@ -16,8 +16,10 @@ __global__ void compute_rgbs(
 	ENerfActivation rgb_activation, 			//activation of rgb in output 
 	ENerfActivation density_activation,			//activation of density in output 
 	PitchedPtr<NerfCoordinate> coords_in,		//network input,(xyz,dt,dir)
+	PitchedPtr<NerfSampleInfo> sampleinfo,		//network input,(ws,ts,te)
 	uint32_t *__restrict__ numsteps_in,			//rays offset and base counter before compact
 	Array3f *rgb_output, 						//rays rgb output
+	Array3f *opacity_output, 					//rays opacity output
 	uint32_t *__restrict__ numsteps_compacted_in,//rays offset and base counter after compact
 	const Array3f *bg_color_ptr,				//background color 
 	int NERF_CASCADES,							//num of density grid level
@@ -38,6 +40,7 @@ __global__ void compute_rgbs(
 		return;
 	}
 	coords_in += base;
+	sampleinfo += base;
 	network_output += base * padded_output_width;
 
 	float T = 1.f;
@@ -45,6 +48,7 @@ __global__ void compute_rgbs(
 	float EPSILON = 1e-4f;
 
 	Array3f rgb_ray = Array3f::Zero();
+	Array3f opacity_ray = Array3f::Zero();
 
 	uint32_t compacted_numsteps = 0;
 	for (; compacted_numsteps < numsteps; ++compacted_numsteps)
@@ -60,9 +64,19 @@ __global__ void compute_rgbs(
 		const float weight = alpha * T;
 		rgb_ray += weight * rgb;
 
+		// add opacity
+		opacity_ray[0] += weight;
+
+		// save weight
+		sampleinfo.ptr->ws = weight;
+		sampleinfo.ptr->ts = coords_in.ptr->ts;
+		sampleinfo.ptr->te = coords_in.ptr->te;
+		// coords_in.ptr->ws = weight
+
 		T *= (1.f - alpha);
 		network_output += padded_output_width;
 		coords_in += 1;
+		sampleinfo += 1;
 	}
 
 	if (compacted_numsteps == numsteps_in[i * 2 + 0])
@@ -71,6 +85,7 @@ __global__ void compute_rgbs(
 	}
 
 	rgb_output[i] = rgb_ray;
+	opacity_output[i] = opacity_ray;
 }
 
 template <typename TYPE>
@@ -85,7 +100,11 @@ __global__ void compute_rgbs_grad(
 	ENerfActivation rgb_activation,				//activation of rgb in output 
 	ENerfActivation density_activation,			//activation of density in output 
 	Array3f *__restrict__ loss_grad,			//dloss_dRGBoutput
+	Array3f *__restrict__ loss_grad_opacity,	//dloss_dopacity_output
+	float *__restrict__ dL_dws,	//dloss_dsampleinfo_output
+	float *__restrict__ dL_dws_x_ws,
 	Array3f *__restrict__ rgb_ray,				//RGB from forward calculation
+	Array3f *__restrict__ opacity_ray,			//opacity from forward calculation
 	float *__restrict__ density_grid_mean,		//density_grid mean value,
 	int NERF_CASCADES,							//num of density grid level
 	float MIN_CONE_STEPSIZE						//lower bound of step size
@@ -106,16 +125,31 @@ __global__ void compute_rgbs_grad(
 	network_output += base * padded_output_width;
 	dloss_doutput += base * padded_output_width;
 	loss_grad += i;
+	loss_grad_opacity += i;
 	rgb_ray += i;
+	opacity_ray+=i;
 
 	const float output_l2_reg = rgb_activation == ENerfActivation::Exponential ? 1e-4f : 0.0f;
 	const float output_l1_reg_density = *density_grid_mean < NERF_MIN_OPTICAL_THICKNESS() ? 1e-4f : 0.0f;
 
-	float T = 1.f;
+
+	float dL_dws_x_ws_sum = 0.f;
+
 	uint32_t compacted_numsteps = 0;
+	for (; compacted_numsteps < numsteps; ++compacted_numsteps)
+	{
+		uint32_t sidx = base + compacted_numsteps;
+		dL_dws_x_ws_sum += dL_dws_x_ws[sidx];
+		dL_dws_x_ws[sidx] = dL_dws_x_ws_sum;
+	}
+
+	float T = 1.f;
+	compacted_numsteps = 0;
 	Array3f rgb_ray2 = Array3f::Zero();
 	for (; compacted_numsteps < numsteps; ++compacted_numsteps)
 	{
+
+		uint32_t sidx = base + compacted_numsteps;
 		
 		const vector_t<TYPE, 4> local_network_output = *(vector_t<TYPE, 4> *)network_output;
 		const Array3f rgb = network_to_rgb(local_network_output, rgb_activation);
@@ -127,6 +161,7 @@ __global__ void compute_rgbs_grad(
 		T *= (1.f - alpha);
 
 		const Array3f suffix = *rgb_ray - rgb_ray2; 
+		const Array3f opacity_suffix = 1.f - (*opacity_ray); 
 		const Array3f dloss_by_drgb = weight * (*loss_grad);
 
 		vector_t<TYPE, 4> local_dL_doutput;
@@ -137,7 +172,13 @@ __global__ void compute_rgbs_grad(
 		local_dL_doutput[2] = loss_scale * (dloss_by_drgb.z() * network_to_rgb_derivative(local_network_output[2], rgb_activation) + fmaxf(0.0f, output_l2_reg * (float)local_network_output[2]));
 
 		float density_derivative = network_to_density_derivative(float(local_network_output[3]), density_activation);
-		float dloss_by_dmlp = density_derivative * (dt * (*loss_grad).matrix().dot((T * rgb - suffix).matrix()));
+		float dloss_by_op = (*loss_grad_opacity).matrix().dot(opacity_suffix.matrix());
+		float dloss_by_ws = T*dL_dws[sidx] - (dL_dws_x_ws_sum - dL_dws_x_ws[sidx]);
+		float dloss_by_dmlp = density_derivative * (
+				dt * (
+					(*loss_grad).matrix().dot((T * rgb - suffix).matrix())+dloss_by_op+dloss_by_ws
+				)
+			);
 		local_dL_doutput[3] = loss_scale * dloss_by_dmlp + (float(local_network_output[3]) < 0 ? -output_l1_reg_density : 0.0f);
 		*(vector_t<TYPE, 4> *)dloss_doutput = local_dL_doutput;
 

@@ -101,9 +101,15 @@ __global__ void rays_sampler(
 		if (density_grid_occupied_at(pos, density_grid, mip))
 		{
 
-			coords_out(j)->set_with_optional_light_dir(warp_position(pos, aabb), warped_dir, warp_dt(dt), light_dir_warped, coords_out.stride_in_bytes);
+			// coords_out(j)->set_with_optional_light_dir(warp_position(pos, aabb), warped_dir, warp_dt(dt), light_dir_warped, coords_out.stride_in_bytes);
+			// ++j;
+			// t += dt;
+
+			float ts = t;
 			++j;
 			t += dt;
+			float te = t;
+			coords_out(j)->set_with_optional_light_dir(warp_position(pos, aabb), warped_dir, warp_dt(dt), ts, te, light_dir_warped, coords_out.stride_in_bytes);
 		}
 		else
 		{

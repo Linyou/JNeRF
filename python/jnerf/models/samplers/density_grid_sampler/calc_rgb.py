@@ -42,17 +42,32 @@ class CalcRgb(Function):
         self.rays_numsteps_compacted = rays_numsteps_compacted.detach()
         self.coords_in = coords_in.detach()
         self.n_rays_per_batch=rays_numsteps.shape[0]
-        rgb_output = jt.code((self.n_rays_per_batch, 3), 'float32',
-                             inputs=[network_output, coords_in, rays_numsteps, rays_numsteps_compacted,training_background_color], 
-                             cuda_header=global_headers+self.density_grad_header+'#include "calc_rgb.h"', cuda_src=f"""
+
+        # print('rays_numsteps', rays_numsteps.shape)
+        # print("rays_numsteps_compacted", rays_numsteps_compacted.shape)
+        # print("rays_numsteps", rays_numsteps.shape)
+        # print(self.n_rays_per_batch)
+        # print(coords_in.shape[0])
+        rgb_output = jt.empty((self.n_rays_per_batch, 3), 'float32')
+        opacity_output = jt.empty((self.n_rays_per_batch, 3), 'float32')
+        sampleinfo = jt.empty((coords_in.shape[0], 3), 'float32')
+        rgb_output, sampleinfo, opacity_output= jt.code(
+            inputs=[network_output, coords_in, rays_numsteps, rays_numsteps_compacted,training_background_color], 
+            outputs=[rgb_output,sampleinfo,opacity_output], 
+        cuda_header=global_headers+self.density_grad_header+'#include "calc_rgb.h"', cuda_src=f"""
         #define grad_t in0_type
         @alias(network_output, in0)
         @alias(coords_in, in1)
         @alias(rays_numsteps,in2)
         @alias(rgb_output,out0)
+        @alias(sampleinfo,out1)
+        @alias(opacity_output,out2)
         @alias(rays_numsteps_compacted,in3)
         @alias(training_background_color,in4)
         cudaStream_t stream=0;
+
+        cudaMemsetAsync(sampleinfo_p, 0, sampleinfo->size);
+        cudaMemsetAsync(opacity_output_p, 0, opacity_output->size);
     
      
         const unsigned int num_elements=network_output_shape0;
@@ -64,19 +79,32 @@ class CalcRgb(Function):
 
         linear_kernel(compute_rgbs<grad_t>, 0,stream,
             n_rays, m_aabb,padded_output_width,(grad_t*)network_output_p,rgb_activation,density_activation,
-            PitchedPtr<NerfCoordinate>((NerfCoordinate*)coords_in_p, 1, 0, 0),(uint32_t*)rays_numsteps_p,(Array3f*)rgb_output_p,(uint32_t*)rays_numsteps_compacted_p,(Array3f*)training_background_color_p,NERF_CASCADES(),MIN_CONE_STEPSIZE());   
+            PitchedPtr<NerfCoordinate>((NerfCoordinate*)coords_in_p, 1, 0, 0),PitchedPtr<NerfSampleInfo>((NerfSampleInfo*)sampleinfo_p, 1, 0, 0),(uint32_t*)rays_numsteps_p,(Array3f*)rgb_output_p,(Array3f*)opacity_output_p,(uint32_t*)rays_numsteps_compacted_p,(Array3f*)training_background_color_p,NERF_CASCADES(),MIN_CONE_STEPSIZE());   
 """)
 
         rgb_output.compile_options = self.rgb_options
         rgb_output.sync()
         self.rgb_output = rgb_output.detach()
-        return rgb_output
+        opacity_output.sync()
+        self.opacity_output = opacity_output.detach()
+        sampleinfo.sync()
+        self.sampleinfo = sampleinfo.detach()
+        ws = sampleinfo[:, 0]
+        t1 = sampleinfo[:, 1]
+        t2 = sampleinfo[:, 2]
+        return rgb_output, opacity_output, ws.detach(), t1.detach(), t2.detach()
 
-    def grad(self, grad_x):
+    def grad(self, grad_x, grad_y, grad_z, grad_t1, grad_t2):
        # return
        # dloss_doutput num_element x 4
+        # grad_y = jt.empty((self.n_rays_per_batch, 3), 'float32')
+        # grad_z = jt.zeros((self.n_rays_per_batch, 3), 'float32')
+        # grad_y = jt.zeros((self.n_rays_per_batch, ), 'float32')
+
+        dL_dws_x_ws = grad_z * self.sampleinfo[:, 0]
+        # print(dL_dws_x_ws.max(), dL_dws_x_ws.min())
         dloss_doutput = jt.code((self.num_elements, 4), self.grad_type,
-                                inputs=[self.network_output, self.rays_numsteps_compacted, self.coords_in, grad_x, self.rgb_output, self.density_grid_mean], 
+                                inputs=[self.network_output, self.rays_numsteps_compacted, self.coords_in, grad_x, self.rgb_output, self.density_grid_mean, grad_y,self.opacity_output, grad_z, dL_dws_x_ws.float()], 
                                 cuda_header=global_headers+self.density_grad_header+'#include "calc_rgb.h"', cuda_src=f"""
         #define grad_t out0_type
         @alias(network_output, in0)
@@ -85,6 +113,10 @@ class CalcRgb(Function):
         @alias(grad_x,in3)
         @alias(rgb_output,in4)
         @alias(density_grid_mean,in5)
+        @alias(grad_y,in6)
+        @alias(opacity_output,in7)
+        @alias(grad_z,in8)
+        @alias(dL_dws_x_ws,in9)
         @alias(dloss_doutput,out0)
 
 
@@ -99,7 +131,7 @@ class CalcRgb(Function):
         ENerfActivation density_activation=ENerfActivation({self.density_activation});
         linear_kernel(compute_rgbs_grad<grad_t>, 0,stream,
             n_rays, m_aabb,padded_output_width,(grad_t*)dloss_doutput_p,(grad_t*)network_output_p,(uint32_t*)rays_numsteps_p,
-            PitchedPtr<NerfCoordinate>((NerfCoordinate*)coords_in_p, 1, 0, 0),rgb_activation,density_activation,(Array3f*)grad_x_p,(Array3f*)rgb_output_p,(float*)density_grid_mean_p,NERF_CASCADES(),MIN_CONE_STEPSIZE());   
+            PitchedPtr<NerfCoordinate>((NerfCoordinate*)coords_in_p, 1, 0, 0), rgb_activation,density_activation,(Array3f*)grad_x_p, (Array3f*)grad_y_p, (float*)grad_z_p, (float*)dL_dws_x_ws_p ,(Array3f*)rgb_output_p,(Array3f*)opacity_output_p,(float*)density_grid_mean_p,NERF_CASCADES(),MIN_CONE_STEPSIZE());   
 
 """)
 

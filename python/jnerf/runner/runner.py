@@ -9,7 +9,10 @@ from jnerf.utils.config import get_cfg, save_cfg
 from jnerf.utils.registry import build_from_cfg,NETWORKS,SCHEDULERS,DATASETS,OPTIMS,SAMPLERS,LOSSES
 from jnerf.models.losses.mse_loss import img2mse, mse2psnr
 from jnerf.dataset import camera_path
+from jnerf.models.samplers.density_grid_sampler import Pack, Distortion
+from jnerf.models.losses.nerf_op import distortion, opacity_loss
 import cv2
+from visdom import Visdom
 
 class Runner():
     def __init__(self):
@@ -59,8 +62,26 @@ class Runner():
         self.W = self.image_resolutions[0]
         self.H = self.image_resolutions[1]
 
+        self.pack = Pack(self.sampler.density_grad_host_header, using_fp16=self.using_fp16)
+        self.dis_loss = Distortion(self.sampler.density_grad_host_header, using_fp16=self.using_fp16)
+
+        self.viz = Visdom()
+
     def train(self):
-        for i in tqdm(range(self.start, self.tot_train_steps)):
+        pbar = tqdm(range(self.start, self.tot_train_steps))
+        op_loss = 0.0
+        dis_loss = 0.0
+        self.viz.line([0,],[0,], win='loss', opts=dict(title='loss'))
+        self.viz.line([0,],[0,], win='distortion loss', opts=dict(title='distortion loss'))
+        self.viz.line([0,],[0,], win='opacity loss', opts=dict(title='opacity loss'))
+        print("aabb_range: ", self.dataset["train"].aabb_range)
+        print("x-max: ", self.dataset["train"].transforms_gpu[:, 3, 0].max())
+        print("x-min: ", self.dataset["train"].transforms_gpu[:, 3, 0].min())
+        print("y-max: ", self.dataset["train"].transforms_gpu[:, 3, 1].max())
+        print("y-min: ", self.dataset["train"].transforms_gpu[:, 3, 1].min())
+        print("z-max: ", self.dataset["train"].transforms_gpu[:, 3, 2].max())
+        print("z-min: ", self.dataset["train"].transforms_gpu[:, 3, 2].min())
+        for i in pbar:
             self.cfg.m_training_step = i
             img_ids, rays_o, rays_d, rgb_target = next(self.dataset["train"])
             training_background_color = jt.random([rgb_target.shape[0],3]).stop_grad()
@@ -69,10 +90,18 @@ class Runner():
 
             pos, dir = self.sampler.sample(img_ids, rays_o, rays_d, is_training=True)
             network_outputs = self.model(pos, dir)
-            rgb = self.sampler.rays2rgb(network_outputs, training_background_color)
-
+            rgb, opacity, ws, t1, t2 = self.sampler.rays2rgb(network_outputs, training_background_color)
+            # print(sampleinfo.shape)
+            # ws_f, t1_f, t2_f = self.pack(self.sampler._rays_numsteps_compacted, ws, t1, t2)
+            # print(unpack_sampleinfo.shape)
             loss = self.loss_func(rgb, rgb_target)
-            self.optimizer.step(loss)
+            dis_loss = self.dis_loss(self.sampler._rays_numsteps_compacted, ws, t1, t2)*self.loss_func.distortion_fator
+            op_loss = opacity_loss(opacity[:, 0]) * self.loss_func.opacity_fator
+            # with jt.no_grad():
+            # dis_loss = distortion(ws_f, t1_f,t2_f) * self.loss_func.distortion_fator
+            # loss = self.loss_func(rgb, rgb_target)
+            self.optimizer.step(loss+dis_loss+op_loss)
+            # self.optimizer.step(i, loss+dis_loss+op_loss)
             self.ema_optimizer.ema_step()
             if self.using_fp16:
                 self.model.set_fp16()
@@ -80,6 +109,13 @@ class Runner():
             if i>0 and i%self.val_freq==0:
                 psnr=mse2psnr(self.val_img(i))
                 print("STEP={} | LOSS={} | VAL PSNR={}".format(i,loss.mean().item(), psnr))
+            if i > 0 and i % 50 == 0:
+                result = {'loss': loss.mean().item(), 'dis_loss': dis_loss.mean().item(), 'op_loss': op_loss.mean().item(), 'lr': self.optimizer._nested_optimizer.lr}
+                self.viz.line([result['loss'],], [i,], win='loss', update='append')
+                self.viz.line([result['dis_loss'],], [i,], win='distortion loss', update='append')
+                self.viz.line([result['op_loss'],], [i,], win='opacity loss', update='append')
+                # "op_loss": op_loss.mean().item()
+                pbar.set_postfix(result)
         self.save_ckpt(os.path.join(self.save_path, "params.pkl"))
         self.test()
     
